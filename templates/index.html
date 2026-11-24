@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>端侧推理 · 内存试跑</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="hero-text">
+        <p class="eyebrow">on-device inference / memory dry run</p>
+        <h1>端侧推理 · 内存试跑</h1>
+        <p class="lede">
+          把输入、中间结果和输出都放进一块定长 float32 缓冲。按算子顺序模拟逐项加法、
+          ReLU 和连续切片视图，观察分配、回收、整理与缓冲占用峰值。
+        </p>
+      </div>
+      <div class="hero-badge">
+        <span class="dot"></span> 单块缓冲 · 定长
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="panel form-panel" aria-labelledby="form-title">
+        <div class="panel-head">
+          <h2 id="form-title">试跑配置</h2>
+          <span class="hint">容量与长度均按 float32 元素计</span>
+        </div>
+
+        <div class="field">
+          <label for="capacity">缓冲容量</label>
+          <div class="inline">
+            <input id="capacity" type="number" min="1" max="1000000" step="1" value="48" inputmode="numeric">
+            <span class="unit">个元素</span>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="inputs">输入张量 <span class="tag">一维 float32</span></label>
+          <textarea id="inputs" spellcheck="false" rows="7" autocomplete="off"></textarea>
+          <p class="field-help">每行一个张量，格式 <code>名称: v1, v2, ...</code>，数值可用逗号或空格分隔。</p>
+        </div>
+
+        <div class="field">
+          <label for="ops">算子顺序 <span class="tag">add / relu / slice</span></label>
+          <textarea id="ops" spellcheck="false" rows="8" autocomplete="off"></textarea>
+          <p class="field-help">
+            每行 <code>结果 = add(a, b)</code>、<code>结果 = relu(x)</code>、
+            <code>结果 = slice(x, 起始, 结束)</code>；切片为步长 1 的连续视图。
+          </p>
+        </div>
+
+        <div class="field">
+          <label for="outputs">要保留的输出</label>
+          <input id="outputs" type="text" spellcheck="false" autocomplete="off">
+          <p class="field-help">逗号分隔。指定输出会一直驻留到执行结束，最后再统一回收。</p>
+        </div>
+
+        <div class="presets">
+          <span class="presets-label">示例</span>
+          <button type="button" class="chip" data-preset="fragmentation">空闲区分散 → 整理</button>
+          <button type="button" class="chip" data-preset="slice">保留切片视图</button>
+          <button type="button" class="chip" data-preset="full">容量不足</button>
+        </div>
+
+        <div class="actions">
+          <button id="run" type="button" class="primary">开始试跑</button>
+          <span id="run-status" class="run-status" role="status" aria-live="polite"></span>
+        </div>
+
+        <div id="form-errors" class="errors" hidden></div>
+      </section>
+
+      <section class="panel result-panel" aria-labelledby="result-title">
+        <div class="panel-head">
+          <h2 id="result-title">试跑结果</h2>
+          <span id="result-meta" class="hint"></span>
+        </div>
+
+        <div id="empty" class="empty">
+          <p>填写左侧配置后点击“开始试跑”。</p>
+          <p class="empty-sub">默认示例演示：切片视图与来源张量共用存储，且来源释放后视图仍保留数据。</p>
+        </div>
+
+        <div id="result" hidden>
+          <div id="status" class="status"></div>
+
+          <div id="stats" class="stat-grid"></div>
+
+          <div class="block">
+            <div class="block-head">
+              <h3>缓冲占用峰值</h3>
+              <span id="peak-caption" class="hint"></span>
+            </div>
+            <div class="peakbar">
+              <div id="peak-fill" class="peakbar-fill"></div>
+              <div class="peakbar-ticks"><span>0</span><span id="peak-cap"></span></div>
+            </div>
+          </div>
+
+          <div id="failure-block" class="block" hidden>
+            <div class="block-head"><h3>失败位置</h3></div>
+            <div id="failure" class="failure"></div>
+          </div>
+
+          <div id="output-block" class="block">
+            <div class="block-head">
+              <h3>保留输出</h3>
+              <span class="hint">按执行结束时的缓冲区内容读出</span>
+            </div>
+            <div id="outputs" class="outputs"></div>
+          </div>
+
+          <div class="block">
+            <div class="block-head">
+              <h3>缓冲布局</h3>
+              <span id="layout-meta" class="hint"></span>
+            </div>
+            <div id="layout" class="layout-bar" role="img" aria-label="缓冲布局"></div>
+            <div id="layout-note" class="layout-note"></div>
+            <div id="layout-legend" class="legend"></div>
+          </div>
+
+          <div class="block">
+            <div class="block-head">
+              <h3>执行时间线</h3>
+              <span class="hint">每步的占用、回收与整理</span>
+            </div>
+            <ol id="timeline" class="timeline"></ol>
+          </div>
+
+          <div id="warnings-block" class="block" hidden>
+            <div class="block-head"><h3>提示</h3></div>
+            <ul id="warnings" class="warnings"></ul>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>输入、中间值与输出共用一块定长缓冲；add / relu 各自分配独立连续空间；slice 共享来源整块存储。</span>
+    </footer>
+  </div>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
