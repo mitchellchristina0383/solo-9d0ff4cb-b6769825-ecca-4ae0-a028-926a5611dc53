@@ -1,4 +1,4 @@
-/* Memory dry-run page logic: submit plan, render report. */
+/* Memory dry-run page logic: submit plan, render report, split handoff. */
 (function () {
   "use strict";
 
@@ -8,18 +8,28 @@
       inputs: "a: 1, -4, 3, 2\nsep: 5, 5\nb: -1, 6, 7, -2\nc: 2, -3, 4, 8, -5, 1",
       ops: "u = relu(a)\nv = relu(b)\nw = relu(c)\nz = relu(sep)",
       outputs: "u, v, w, z",
+      split_after: "",
     },
     slice: {
       capacity: "24",
       inputs: "X: 1, -2, 3, -4\nA: 10, -20, 30, -40, 50, -60\nY: -1, -2, 6, 7, -8, 9",
       ops: "v = slice(A, 1, 4)\np = relu(X)\nq = relu(Y)",
       outputs: "v, p, q",
+      split_after: "",
     },
     full: {
       capacity: "10",
       inputs: "a: 1, 2, 3, 4\nb: 10, 20, 30, 40",
       ops: "c = add(a, b)",
       outputs: "c",
+      split_after: "",
+    },
+    overlap: {
+      capacity: "16",
+      inputs: "X: 1, -2, 3, -4, 5, -6, 7, -8\nY: 10, 20, 30, 40",
+      ops: "v1 = slice(X, 1, 5)\nv2 = slice(X, 3, 7)\nr = relu(v1)\ns = add(v2, Y)",
+      outputs: "r, s",
+      split_after: "1",
     },
   };
 
@@ -29,6 +39,8 @@
   ];
 
   var $ = function (id) { return document.getElementById(id); };
+  var selectedPackage = null;
+  var selectedPackageName = "";
 
   function el(tag, className, text) {
     var node = document.createElement(tag);
@@ -53,12 +65,54 @@
     $("inputs").value = preset.inputs;
     $("ops").value = preset.ops;
     $("outputs").value = preset.outputs;
+    syncSplitOptions(preset.split_after);
     clearErrors();
     setStatus("");
   }
 
+  // Parse op result names in text order so the dropdown tracks the textarea.
+  function opNames() {
+    var names = [];
+    $("ops").value.split(/\r?\n/).forEach(function (line) {
+      var match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=/);
+      if (match) names.push(match[1]);
+    });
+    return names;
+  }
+
+  function syncSplitOptions(preferred) {
+    var select = $("split-after");
+    var previous = preferred !== undefined ? String(preferred) : select.value;
+    var names = opNames();
+    select.innerHTML = "";
+    select.appendChild(new Option("不分段：整份计划一次跑完", ""));
+    names.forEach(function (name, index) {
+      var disabled = index === names.length - 1;
+      var option = new Option(
+        (index + 1) + ". " + name + (disabled ? "（最后一个算子，后段为空不可选）" : ""),
+        String(index)
+      );
+      option.disabled = disabled;
+      select.appendChild(option);
+    });
+    // Keep the previous choice when it is still valid; a split at the last
+    // op would leave the back segment empty, so fall back to the one before.
+    var valid = Array.prototype.map.call(select.options, function (o) { return o.value; });
+    if (valid.indexOf(previous) >= 0 && previous !== String(names.length - 1)) {
+      select.value = previous;
+    } else if (names.length > 1) {
+      select.value = String(Math.max(0, names.length - 2));
+    } else {
+      select.value = "";
+    }
+  }
+
   function setStatus(text) {
     $("run-status").textContent = text;
+  }
+
+  function setBackStatus(text) {
+    $("back-status").textContent = text;
   }
 
   function clearErrors() {
@@ -78,12 +132,30 @@
     box.appendChild(list);
   }
 
+  function showBackErrors(messages) {
+    var box = $("back-errors");
+    box.hidden = false;
+    box.innerHTML = "";
+    var list = el("ul");
+    messages.forEach(function (message) {
+      list.appendChild(el("li", null, message));
+    });
+    box.appendChild(list);
+  }
+
+  function clearBackErrors() {
+    var box = $("back-errors");
+    box.hidden = true;
+    box.innerHTML = "";
+  }
+
   function payload() {
     return {
       capacity: $("capacity").value.trim(),
       inputs: $("inputs").value,
       ops: $("ops").value,
       outputs: $("outputs").value,
+      split_after: $("split-after").value,
     };
   }
 
@@ -117,7 +189,7 @@
         return;
       }
       render(data);
-      setStatus("");
+      setStatus(data.handoff ? "前段试跑完成，交接包已就绪" : "");
     } catch (err) {
       showErrors(["无法连接到服务器：" + err.message]);
       $("empty").hidden = false;
@@ -125,6 +197,129 @@
       setStatus("");
     } finally {
       setBusy(false);
+    }
+  }
+
+  // -- handoff package ----------------------------------------------------
+  function downloadPackage(pkg) {
+    var blob = new Blob([JSON.stringify(pkg, null, 2)], {
+      type: "application/json",
+    });
+    var url = URL.createObjectURL(blob);
+    var link = document.createElement("a");
+    link.href = url;
+    link.download = "memdry-handoff-" + pkg.split_op.name + ".json";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(function () { URL.revokeObjectURL(url); }, 1000);
+  }
+
+  function renderHandoff(data) {
+    var block = $("handoff-block");
+    if (!data.handoff) {
+      block.hidden = true;
+      return;
+    }
+    block.hidden = false;
+    var h = data.handoff;
+    var box = $("handoff-summary");
+    box.innerHTML = "";
+    function row(key, value) {
+      var r = el("div", "row");
+      r.appendChild(el("span", "k", key));
+      r.appendChild(el("span", "v", value));
+      box.appendChild(r);
+    }
+    row("分界算子", h.split_op.name + "（第 " + (h.split_after + 1) + " 个，后段剩 " +
+      h.package.back_ops.length + " 个算子）");
+    row("传输元素数", fmt(h.transferred_elements) + " 个 float32（仅可见元素，同一存储位置只传一次）");
+    row("来源存储块", fmt(h.storage_count) + " 块（每块在后段按原长分配一次）");
+    row("位模式", "little-endian IEEE-754 binary32，base64 封装，保留 -0 / inf 等全部位模式");
+    var button = $("download-handoff");
+    button.onclick = function () { downloadPackage(h.package); };
+  }
+
+  // -- back segment run ---------------------------------------------------
+  function onPackagePicked(event) {
+    var file = event.target.files && event.target.files[0];
+    clearBackErrors();
+    if (!file) {
+      selectedPackage = null;
+      selectedPackageName = "";
+      $("handoff-file-info").textContent = "尚未选择文件。原包可反复使用，换容量再试即可。";
+      return;
+    }
+    var reader = new FileReader();
+    reader.onload = function () {
+      try {
+        selectedPackage = JSON.parse(String(reader.result));
+        selectedPackageName = file.name;
+        var info = [];
+        info.push(file.name + "（" + fmt(file.size) + " 字节）");
+        if (selectedPackage && selectedPackage.split_op) {
+          info.push("分界算子 " + selectedPackage.split_op.name);
+        }
+        if (selectedPackage && selectedPackage.transferred_elements !== undefined) {
+          info.push("传输 " + fmt(selectedPackage.transferred_elements) + " 个元素");
+        }
+        $("handoff-file-info").textContent = info.join(" · ");
+        setBackStatus("交接包已载入，可反复换容量试跑");
+      } catch (err) {
+        selectedPackage = null;
+        $("handoff-file-info").textContent = file.name + " 解析失败：" + err.message;
+        showBackErrors(["交接包不是合法 JSON：" + err.message]);
+      }
+    };
+    reader.onerror = function () {
+      selectedPackage = null;
+      showBackErrors(["读取文件失败"]);
+    };
+    reader.readAsText(file, "utf-8");
+  }
+
+  async function runBack() {
+    clearBackErrors();
+    if (!selectedPackage) {
+      showBackErrors(["请先选择前段产出的交接包（.json）"]);
+      return;
+    }
+    var capacity = $("back-capacity").value.trim();
+    if (!capacity) {
+      showBackErrors(["请填写后段缓冲容量（按 float32 元素计）"]);
+      return;
+    }
+    var button = $("run-back");
+    button.disabled = true;
+    button.textContent = "后段试跑中…";
+    setBackStatus("正在载入交接包并继续执行…");
+    try {
+      var form = new FormData();
+      form.append("capacity", capacity);
+      form.append(
+        "package",
+        new Blob([JSON.stringify(selectedPackage)], { type: "application/json" }),
+        selectedPackageName || "handoff.json"
+      );
+      var response = await fetch("/api/handoff/run", { method: "POST", body: form });
+      var data = await response.json().catch(function () { return null; });
+      if (!response.ok || !data) {
+        var messages =
+          data && data.errors && data.errors.length
+            ? data.errors
+            : ["请求失败（HTTP " + response.status + "），请稍后重试"];
+        showBackErrors(messages);
+        setBackStatus("");
+        return;
+      }
+      render(data);
+      setBackStatus(data.ok ? "后段试跑完成" : "后段容量不足，可保留原包换容量再试");
+    } catch (err) {
+      showBackErrors(["无法连接到服务器：" + err.message]);
+      setBackStatus("");
+    } finally {
+      button.disabled = false;
+      button.textContent = "开始后段试跑";
     }
   }
 
@@ -137,12 +332,17 @@
     meta.push("容量 " + fmt(data.capacity) + " 元素");
     meta.push(data.steps.length + " 步");
     if (data.stats.compactions) meta.push(data.stats.compactions + " 次整理");
+    if (data.handoff_meta) {
+      meta.push("后段 · 交接自 " + data.handoff_meta.split_op);
+    }
+    if (data.handoff) meta.push("前段 · 已生成交接包");
     $("result-meta").textContent = meta.join(" · ");
 
     renderStatus(data);
     renderStats(data);
     renderPeak(data);
     renderFailure(data);
+    renderHandoff(data);
     renderOutputs(data);
     renderLayout(data);
     renderTimeline(data);
@@ -160,6 +360,11 @@
         "执行完成：峰值占用 " + fmt(data.peak.elements) + " / " + fmt(data.capacity) +
         " 元素（" + data.peak.percent + "%），结束时占用 " +
         fmt(data.final_occupancy) + " 个元素。";
+      if (data.handoff_meta) {
+        text = "后段" + text;
+      } else if (data.handoff) {
+        text = "前段" + text + " 分界状态已打包，可在下方下载交接包。";
+      }
     } else {
       text = data.failure.message;
     }
@@ -194,7 +399,7 @@
         stat(
           "整理次数",
           fmt(data.stats.compactions) +
-            " <small>" + fmt(data.stats.moved_elements) + " 元素搬移</small>"
+          " <small>" + fmt(data.stats.moved_elements) + " 元素搬移</small>"
         )
       );
       box.appendChild(
@@ -245,11 +450,20 @@
       r.appendChild(v);
       box.appendChild(r);
     }
+    if (f.phase_label) {
+      row("卡住阶段", "<code>" + f.phase_label + "</code>（" +
+        (f.phase === "load" ? "来源存储载入，尚未执行后段算子" : "后段算子执行中") + "）");
+    }
     var action = f.action || {};
-    var label = action.kind === "input"
-      ? "装入输入 " + action.name
-      : "执行 " + (action.name || "?") + " = " + (action.kind || "?") +
+    var label;
+    if (action.kind === "input") {
+      label = "装入输入 " + action.name;
+    } else if (action.kind === "load") {
+      label = "载入 " + action.name + "（来源存储原长 " + fmt(action.length) + " 元素）";
+    } else {
+      label = "执行 " + (action.name || "?") + " = " + (action.kind || "?") +
         "(" + (action.operands || []).join(", ") + ")";
+    }
     row("失败位置", "<code>第 " + f.step + " 步</code> · " + label);
     if (action.line) row("算子行号", "<code>第 " + action.line + " 行</code>");
     row("所需空间", "<code>" + fmt(f.needed) + "</code> 个连续元素");
@@ -459,13 +673,19 @@
   }
 
   // -- wire up ------------------------------------------------------------
-  document.addEventListener("DOMContentLoaded", function () {
+  var initialized = false;
+  function init() {
+    if (initialized) return;
+    initialized = true;
     document.querySelectorAll("[data-preset]").forEach(function (button) {
       button.addEventListener("click", function () {
         loadPreset(button.getAttribute("data-preset"));
       });
     });
     $("run").addEventListener("click", run);
+    $("ops").addEventListener("input", function () { syncSplitOptions(); });
+    $("handoff-file").addEventListener("change", onPackagePicked);
+    $("run-back").addEventListener("click", runBack);
     document.addEventListener("keydown", function (event) {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         event.preventDefault();
@@ -473,5 +693,11 @@
       }
     });
     loadPreset("slice");
-  });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();

@@ -242,13 +242,16 @@ class Allocator:
 
 
 class Executor:
-    def __init__(self, plan: Plan):
+    def __init__(self, plan: Plan, stop_after: int | None = None):
         self.plan = plan
         self.alloc = Allocator(plan.capacity)
         self.handles: dict[str, TensorHandle] = {}
         self.steps: list[dict] = []
         self.warnings = list(plan.warnings)
         self.overflow_values = 0
+        # When set, only plan.ops[: stop_after + 1] run; the rest is the
+        # back segment handed off to the second device.
+        self.stop_after = stop_after
         self.last_use: dict[str, int] = {}
         for index, op in enumerate(plan.ops):
             for name in op.operands:
@@ -383,6 +386,8 @@ class Executor:
 
     def _run_ops(self) -> None:
         for index, op in enumerate(self.plan.ops):
+            if self.stop_after is not None and index > self.stop_after:
+                break
             action = {
                 "name": op.name,
                 "kind": op.kind,
@@ -581,10 +586,24 @@ class Executor:
         }
 
 
-def execute_plan(plan: Plan) -> dict:
-    executor = Executor(plan)
+def execute_plan(plan: Plan, stop_after: int | None = None) -> dict:
+    executor = Executor(plan, stop_after=stop_after)
     try:
         result = executor.run()
+        if stop_after is not None and result["ok"]:
+            # Build the package while the buffer still holds the boundary state.
+            # Imported lazily to avoid an import cycle (handoff imports memory).
+            from .handoff import build_handoff
+
+            package = build_handoff(executor, stop_after)
+            result["handoff"] = {
+                "format": package["format"],
+                "split_after": stop_after,
+                "split_op": package["split_op"],
+                "transferred_elements": package["transferred_elements"],
+                "storage_count": len(package["storages"]),
+                "package": package,
+            }
     finally:
         executor.alloc.buffer = array("f")
     if result["stats"]["overflow_values"]:

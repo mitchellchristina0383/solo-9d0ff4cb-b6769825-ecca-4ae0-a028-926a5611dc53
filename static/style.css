@@ -139,7 +139,7 @@ html, body {
   color: var(--muted);
   font: 500 11px/1.7 var(--mono);
 }
-input[type="number"], input[type="text"], textarea {
+input[type="number"], input[type="text"], textarea, select {
   width: 100%;
   padding: 10px 12px;
   border-radius: 10px;
@@ -149,11 +149,22 @@ input[type="number"], input[type="text"], textarea {
   font: 13.5px/1.7 var(--mono);
   transition: border-color 120ms ease, box-shadow 120ms ease;
 }
+select { appearance: none; cursor: pointer; }
+select:disabled, option:disabled { color: var(--faint); }
 textarea { resize: vertical; min-height: 72px; }
-input:focus, textarea:focus {
+input:focus, textarea:focus, select:focus {
   outline: none;
   border-color: var(--accent-dim);
   box-shadow: 0 0 0 3px rgba(88, 211, 196, 0.14);
+}
+input[type="file"] {
+  width: 100%;
+  padding: 9px 10px;
+  border-radius: 10px;
+  border: 1px dashed var(--line);
+  background: #0d131b;
+  color: var(--muted);
+  font: 12.5px/1.7 var(--mono);
 }
 .inline { display: flex; align-items: center; gap: 10px; }
 .inline input { max-width: 190px; }
@@ -502,6 +513,24 @@ input:focus, textarea:focus {
   color: #f0d49a;
   font-size: 13px;
 }
+
+/* handoff panel */
+.handoff-panel { margin-top: 22px; }
+.handoff-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(180px, 0.6fr) auto;
+  gap: 18px;
+  align-items: end;
+}
+.handoff-grid .field { margin-bottom: 0; }
+.handoff-actions { padding-bottom: 2px; }
+@media (max-width: 980px) {
+  .handoff-grid { grid-template-columns: minmax(0, 1fr); }
+}
+.handoff-summary { margin-bottom: 8px; }
+.handoff-summary .row { display: flex; gap: 10px; padding: 3px 0; flex-wrap: wrap; }
+.handoff-summary .row .k { color: var(--faint); min-width: 104px; }
+.handoff-summary .row .v { font-family: var(--mono); color: var(--text); }
 
 .footer {
   margin-top: 30px;

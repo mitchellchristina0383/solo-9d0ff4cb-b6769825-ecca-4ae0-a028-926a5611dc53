@@ -11,6 +11,9 @@ float32 缓冲**里模拟执行，观察每一步的分配、引用计数回收�
   块向缓冲区头部紧凑搬移（视图随所属存储一起移动，相对偏移不变）后重试。
 - 容量确实不够时返回**失败位置、所需空间、当时总/最大空闲量与仍在使用的值**。
 - 成功时返回各输出值、缓冲占用峰值与逐步时间线。
+- **两台设备分段交接**：在页面选定前段最后一个算子，前段跑完后显示**传输元素数**并
+  提供交接包下载；另开页面上传该包并填写后段缓冲容量，即可从分界后继续执行。详见
+  下文“分段交接”。
 
 ## 运行（Docker Compose）
 
@@ -72,29 +75,58 @@ python3 -m gunicorn --bind 127.0.0.1:8000 --workers 2 --threads 4 \
 ## 接口
 
 `POST /api/run` → 200 + 报告 JSON（容量不足也是 200，`ok=false` 并带 `failure`；
-格式/语义错误返回 400 + `errors`）。
+格式/语义错误返回 400 + `errors`）。请求体在原有四个字段外可选 `split_after`
+（分界算子的零基序号，不能是最后一个算子）；给出且前段成功时，报告额外带 `handoff`
+（含可直接下载的完整交接包 `package`、`transferred_elements`、`split_op` 等）。
+
+`POST /api/handoff/run` → 200 + 后段报告。支持 `multipart/form-data`（文件字段
+`package` + 文本字段 `capacity`，对应页面上传）或 JSON（`{capacity, package}`）。
+交接包格式/语义错误返回 400 + `errors`；后段容量不足仍是 200 + `failure`，其中
+`phase` 区分 `load`（卡在交接包载入）与 `op`（卡在某个后段算子）。
 
 主要字段：`ok`、`outputs[]`（值、角色 `input/result/view`、存储号与偏移、`slice_of`）、
 `peak {elements, percent, at}`、`final_occupancy`、`stats {allocations, compactions,
 moved_elements, free_total, largest_free, overflow_values}`、`steps[]`（每步的
-`allocated / freed / view / compaction / occupancy`）、`layout[]`（当前存储与空闲区，
-含视图相对区间）、`failure`、`warnings`。
+`allocated / freed / view / compaction / occupancy`，后段报告还含 `kind=load` 的载入步）、
+`layout[]`（当前存储与空闲区，含视图相对区间）、`failure`、`warnings`。
+
+## 分段交接
+
+把一份推理计划分到两台设备时，前段在分界算子跑完后停下，产出一个自包含的 JSON 交接包：
+
+- **后段计划**：分界之后的算子（`back_ops`）与最终保留输出（`outputs`）。
+- **交接张量**：分界时仍存活、且被后段算子直接引用或被指定保留的张量，连同视图的
+  来源张量（仅作关系元数据）。
+- **只传可见元素**：按来源存储块分组，把块内各张量的相对区间取**并集**后序列化——
+  重叠切片的重叠位置只传一次；已释放的来源张量不占传输元素。
+- **保留 float32 位模式**：元素以 little-endian IEEE-754 binary32 原样打包再 base64
+  封装，`-0`、`inf` 等位模式逐位保留（不经过文本数字的重新解析）。
+
+后段载入时，**每块来源存储按原长只分配一次**，原张量与所有同源切片共用这块存储，
+引用计数保持“最后一个引用用完才释放”。后段报告给出自己的占用峰值与保留输出，输出值
+与整份计划一次跑完完全一致（见测试里的逐元素与随机差分对照）。容量不足时报告会指出
+卡在“载入交接包”（哪块来源存储放不下）还是“执行后段算子”（具体哪个算子），**原包
+不会被消耗**，换容量再试即可。
+
+页面操作：左侧“前段分界”下拉选定最后一个前段算子 → 开始试跑 → 在结果区“分段交接包”
+查看传输元素数并下载 `.json`；页面下方“后段试跑”面板上传该包、填后段缓冲容量后继续。
 
 ## 代码结构
 
 ```
 memdry/model.py    计划解析 + 静态校验（长度、切片边界、名称、上限）
-memdry/memory.py   定长缓冲分配器（首次适配、合并、整理）+ 执行器（引用计数、视图）
-memdry/app.py      Flask 路由：/、/healthz、POST /api/run
-templates/index.html, static/{app.js,style.css}   单页界面
-tests/             pytest：分配器、执行器、解析与 HTTP
+memdry/memory.py   定长缓冲分配器（首次适配、合并、整理）+ 执行器（引用计数、视图、分界停跑）
+memdry/handoff.py  交接包构建/校验 + 后段执行器（来源存储一次性载入、阶段化容量不足报告）
+memdry/app.py      Flask 路由：/、/healthz、POST /api/run、POST /api/handoff/run
+templates/index.html, static/{app.js,style.css}   单页界面（含分界选择与后段试跑面板）
+tests/             pytest：分配器、执行器、解析与 HTTP、分段交接
 ```
 
 ## 测试
 
 ```bash
 python3 -m pip install pytest
-python3 -m pytest -q          # 31 passed
+python3 -m pytest -q          # 44 passed
 ```
 
 ## 实测结果
@@ -103,25 +135,36 @@ python3 -m pytest -q          # 31 passed
 
 | 场景 | 结果 |
 | --- | --- |
-| `pytest` | 31 passed |
+| `pytest` | 44 passed（原 31 + 分段交接 13） |
 | 空闲区分散示例 | 峰值 22/24（91.67%），整理 1 次、搬移 10 元素，最大连续空闲 4→8，四个输出正确 |
 | 保留切片 + 整理 | 峰值 22/24，整理 1 次、搬移 16 元素，视图从偏移 5 移到 1，值 `-20, 30, -40` 不变 |
 | 容量不足 | `ok=false`，失败于第 3 步 `c = add(a, b)`，需要 4、空闲 2、最大连续 2，`live=[a, b]` |
 | 视图共享/引用计数 | `v=slice(x,1,4)` 时 `x` 释放但存储保留；视图释放后才归还整块 |
 | 随机对照（2977 个有效计划） | 与无缓冲参考实现的逐元素结果一致；布局无重叠、占用/空闲守恒 |
 | 分配器随机压测（500 轮 × 80 次操作） | 搬移后内容不变、无重叠、失败仅当总空闲不足 |
-| gunicorn 双 worker 试跑 | `/healthz` 200；页面与两个静态资源 200；API 成功/失败路径正常 |
+| 分段随机差分（400 个计划 × 各分界点，1117 次分段执行） | 后段输出与整份一次跑逐元素一致，无失败/异常 |
+| 重叠切片交接（页面示例） | `v1=X[1:5]`、`v2=X[3:7]` 只传并集 `X[1:7]` 共 6 元素（两视图名义引用 8 个），总传输 10；后段峰值 20/24，`r,s` 与整跑一致 |
+| float32 位模式 | `-0.0` 与加法溢出产生的 `inf` 经 base64 往返后位模式逐位不变（`0x80000000`、`0x7F800000`） |
+| 后段容量不足 | 容量 6 明确报告卡在“载入交接包”的 X 块（需 8）；容量 16 报告卡在算子 `s = add(v2, Y)`；同一原包换容量 24 即成功 |
+| gunicorn 双 worker 试跑 | `/healthz` 200；页面与两个静态资源 200；两个 API 的成功/失败路径正常 |
+| jsdom 端到端（真实页面 + 真实接口，19 项检查） | 分界下拉同步、交接包下载、上传、载入/算子两阶段失败、换容量重试、输出与峰值渲染均通过 |
 
 ## 未完成项与已知限制
 
-- **未在真实 Docker 中构建运行**：当前环境没有 `docker`/`podman`。已按 compose
-  参数（2 worker、`--no-control-socket`、只读根文件系统、tmpfs `/tmp`）在本地
-  gunicorn 上跑通，并对 YAML 做了解析校验；首次 `docker compose up --build` 仍需
-  在有 Docker 的机器上确认。
-- **未做浏览器端视觉核对**：环境没有 Chromium/Firefox。前端用 jsdom 驱动真实接口
-  做了 DOM 级冒烟测试（三个示例 + 校验错误），但没有渲染截图。
+- **未在真实 Docker 中构建运行**：当前环境没有 `docker`/`podman`。本次未改
+  Dockerfile 与 compose（新功能只用 Python 标准库 + 现有 Flask，无新依赖），并按
+  compose 参数（2 worker、`--no-control-socket`、只读根文件系统、tmpfs `/tmp`）在
+  本地 gunicorn 上跑通；首次 `docker compose up --build` 仍需在有 Docker 的机器上确认。
+- **未做浏览器截图级视觉核对**：环境没有 Chromium/Firefox。前端用 jsdom 加载真实
+  页面与真实 `app.js`、对接运行中的 gunicorn 做了 DOM 级端到端测试（含重叠切片交接
+  与后段容量不足），但没有真实渲染截图。
 - 模拟只覆盖 `add`、`relu`、步长 1 的连续切片；不支持广播、跨步/负步长切片、
   多输出算子、非 float32 类型。
+- 交接包是**纯 JSON、不含签名或加密**：它会携带分界张量的数值，设计前提是两台设备
+  之间的通道本身可信；当前没有做来源校验、机密性保护或包体大小的独立配额（仅受
+  8 MiB 请求体上限约束）。
+- 分界只能选算子（不能选“某个输入装入之后”）；前段至少保留一个算子给后段，因此
+  单算子计划无法分段。
 - 加法按 `array('f')` 的 IEEE-754 binary32 做逐项运算；极少数情况下中间舍入与硬件
   FMA 的实现可能相差 1 ulp。溢出记作 `inf` 并在提示中计数。
 - 分配策略是确定性的首次适配＋全量整理；不模拟真实硬件对齐、内存池或分页开销，

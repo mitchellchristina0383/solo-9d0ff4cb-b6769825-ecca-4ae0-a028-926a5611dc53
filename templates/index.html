@@ -58,11 +58,23 @@
           <p class="field-help">逗号分隔。指定输出会一直驻留到执行结束，最后再统一回收。</p>
         </div>
 
+        <div class="field">
+          <label for="split-after">前段分界 <span class="tag">两台设备分段</span></label>
+          <select id="split-after">
+            <option value="">不分段：整份计划一次跑完</option>
+          </select>
+          <p class="field-help">
+            选定前段的最后一个算子。前段跑完后只交接后段算子直接使用或指定保留的张量，
+            并提供交接包下载；用下方“后段试跑”上传该包从分界处继续。
+          </p>
+        </div>
+
         <div class="presets">
           <span class="presets-label">示例</span>
           <button type="button" class="chip" data-preset="fragmentation">空闲区分散 → 整理</button>
           <button type="button" class="chip" data-preset="slice">保留切片视图</button>
           <button type="button" class="chip" data-preset="full">容量不足</button>
+          <button type="button" class="chip" data-preset="overlap">重叠切片交接</button>
         </div>
 
         <div class="actions">
@@ -105,6 +117,18 @@
             <div id="failure" class="failure"></div>
           </div>
 
+          <div id="handoff-block" class="block" hidden>
+            <div class="block-head">
+              <h3>分段交接包</h3>
+              <button id="download-handoff" type="button" class="chip">下载交接包 (.json)</button>
+            </div>
+            <div id="handoff-summary" class="failure handoff-summary"></div>
+            <p class="field-help">
+              下载后到下方“后段试跑”上传该包并填写后段缓冲容量，即可从分界后继续执行；
+              原包不会被消耗，可换不同容量反复试跑。
+            </p>
+          </div>
+
           <div id="output-block" class="block">
             <div class="block-head">
               <h3>保留输出</h3>
@@ -138,6 +162,32 @@
         </div>
       </section>
     </main>
+
+    <section class="panel handoff-panel" aria-labelledby="handoff-title">
+      <div class="panel-head">
+        <h2 id="handoff-title">后段试跑（第二台设备）</h2>
+        <span class="hint">上传前段交接包，填后段缓冲容量，从分界后继续执行</span>
+      </div>
+      <div class="handoff-grid">
+        <div class="field">
+          <label for="handoff-file">交接包（.json）</label>
+          <input id="handoff-file" type="file" accept=".json,application/json">
+          <p id="handoff-file-info" class="field-help">尚未选择文件。原包可反复使用，换容量再试即可。</p>
+        </div>
+        <div class="field">
+          <label for="back-capacity">后段缓冲容量</label>
+          <div class="inline">
+            <input id="back-capacity" type="number" min="1" max="1000000" step="1" inputmode="numeric" placeholder="例如 14">
+            <span class="unit">个元素</span>
+          </div>
+        </div>
+        <div class="actions handoff-actions">
+          <button id="run-back" type="button" class="primary">开始后段试跑</button>
+          <span id="back-status" class="run-status" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+      <div id="back-errors" class="errors" hidden></div>
+    </section>
 
     <footer class="footer">
       <span>输入、中间值与输出共用一块定长缓冲；add / relu 各自分配独立连续空间；slice 共享来源整块存储。</span>
